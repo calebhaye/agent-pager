@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""agent-pager: reach the AI agent sessions running on a machine via a
+per-machine GitHub issue.
+
+One daemon per machine (`agent-pager daemon`) polls the machine's pager issue
+and mirrors it into a local SQLite bus. Many sessions read and write that bus
+locally (no network, no per-session polling). See README.md.
+
+Python 3 stdlib only. The only external dependency is the `gh` CLI, which the
+daemon shells out to (so it uses your existing GitHub auth, or a bot token via
+PAGER_GH_TOKEN).
+"""
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+HOME = os.environ.get("AGENT_PAGER_HOME", os.path.expanduser("~/.agent-pager"))
+DB_PATH = os.path.join(HOME, "pager.db")
+CONFIG_PATH = os.path.join(HOME, "config")
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS messages(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  dir TEXT NOT NULL,             -- 'in' (a page) | 'out' (a reply)
+  sender TEXT,                   -- github login (in) | session label (out)
+  target TEXT,                   -- session label | '@all' | NULL (informational)
+  act INTEGER NOT NULL DEFAULT 0,-- 1 = the sender wants action
+  body TEXT NOT NULL,
+  via TEXT NOT NULL DEFAULT 'comment',  -- 'comment' | 'sms'
+  status TEXT NOT NULL DEFAULT 'new',
+  gh_comment_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS sessions(
+  label TEXT PRIMARY KEY,
+  cwd TEXT, pid INTEGER, started_at TEXT, last_heartbeat TEXT
+);
+CREATE TABLE IF NOT EXISTS cursors(
+  label TEXT PRIMARY KEY, last_msg_id INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+"""
+
+# Leading address on a page body. Examples:
+#   "@api-backend: rerun specs"  -> ("api-backend", act=1)
+#   "@all! pull main"            -> ("@all", act=1)   broadcast + act
+#   "@all heads up"              -> ("@all", act=0)   broadcast + inform
+#   "main advanced"             -> (None, 0)          informational
+ADDR_RE = re.compile(r"^\s*@([A-Za-z0-9._\-]+)(!?)\s*:?\s*")
+ISSUECOMMENT_RE = re.compile(r"issuecomment-(\d+)")
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def log(msg):
+    print(f"{now_iso()} {msg}", flush=True)
+
+
+def die(msg):
+    print(f"agent-pager: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def load_config():
+    cfg = {}
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip().strip('"').strip("'")
+    for k in ("PAGER_REPO", "PAGER_ISSUE", "PAGER_OWNER", "PAGER_ALLOWLIST",
+              "PAGER_GH_TOKEN", "PAGER_POLL_SECONDS", "PAGER_SESSION_TTL"):
+        if os.environ.get(k):
+            cfg[k] = os.environ[k]
+    return cfg
+
+
+def db():
+    os.makedirs(HOME, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(SCHEMA)
+    return conn
+
+
+def meta_get(conn, key, default=None):
+    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def meta_set(conn, key, value):
+    conn.execute(
+        "INSERT INTO meta(key,value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, str(value)),
+    )
+
+
+def parse_target(body):
+    """(target, act) from a page body. See ADDR_RE."""
+    m = ADDR_RE.match(body or "")
+    if not m:
+        return (None, 0)
+    name, bang = m.group(1), m.group(2)
+    if name.lower() == "all":
+        return ("@all", 1 if bang else 0)
+    return (name, 1)  # addressed to a specific session = act
+
+
+def relevance(target, act, label):
+    """How a message relates to `label`. None means it belongs to someone else."""
+    if target is None:
+        return "info"
+    if target == label:
+        return "FOR YOU"
+    if target == "@all":
+        return "broadcast-act" if act else "broadcast"
+    return None
+
+
+def gh(cfg, args, want_json=False):
+    env = dict(os.environ)
+    if cfg.get("PAGER_GH_TOKEN"):
+        env["GH_TOKEN"] = cfg["PAGER_GH_TOKEN"]
+    proc = subprocess.run(["gh"] + args, capture_output=True, text=True, env=env)
+    if want_json:
+        return proc, (json.loads(proc.stdout) if proc.returncode == 0 and proc.stdout.strip() else None)
+    return proc
+
+
+# ---------------------------------------------------------------- daemon side
+
+def ingest(conn, cfg, repo, issue, allow):
+    proc, comments = gh(cfg, ["api", f"repos/{repo}/issues/{issue}/comments", "--paginate"], want_json=True)
+    if proc.returncode != 0:
+        log(f"fetch failed: {proc.stderr.strip()[:200]}")
+        return
+    comments = comments or []
+
+    # First run: baseline to the newest existing comment so we don't replay
+    # history as fresh pages.
+    if meta_get(conn, "last_comment_id") is None:
+        newest = max((c["id"] for c in comments), default=0)
+        meta_set(conn, "last_comment_id", newest)
+        conn.commit()
+        log(f"baseline set at comment {newest}; only newer comments will page")
+        return
+
+    last = int(meta_get(conn, "last_comment_id", "0"))
+    # Never re-ingest our own outbound comments (avoids a reply -> page loop).
+    ours = {r["gh_comment_id"] for r in conn.execute(
+        "SELECT gh_comment_id FROM messages WHERE dir='out' AND gh_comment_id IS NOT NULL")}
+    new_max = last
+    for c in comments:
+        cid = c["id"]
+        if cid <= last:
+            continue
+        new_max = max(new_max, cid)
+        if cid in ours:
+            continue
+        login = (c.get("user") or {}).get("login", "")
+        body = c.get("body") or ""
+        if login not in allow:
+            log(f"ignored comment {cid} from non-allowlisted '{login}'")
+            continue
+        target, act = parse_target(body)
+        conn.execute(
+            "INSERT INTO messages(ts,dir,sender,target,act,body,gh_comment_id) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (now_iso(), "in", login, target, act, body, cid),
+        )
+        log(f"page in #{cid} from {login} target={target} act={act}")
+    if new_max != last:
+        meta_set(conn, "last_comment_id", new_max)
+    conn.commit()
+
+
+def drain(conn, cfg, repo, issue, owner):
+    rows = conn.execute(
+        "SELECT * FROM messages WHERE dir='out' AND status='new' ORDER BY id").fetchall()
+    for m in rows:
+        if m["via"] == "sms":
+            log(f"out #{m['id']} flagged sms; SMS sink not configured (v1), leaving queued")
+            continue
+        prefix = f"@{owner} " if owner else ""
+        body = f"{prefix}[{m['sender']}] {m['body']}"
+        proc = gh(cfg, ["issue", "comment", str(issue), "--repo", repo, "--body", body])
+        if proc.returncode == 0:
+            m_id = None
+            found = ISSUECOMMENT_RE.search(proc.stdout or "")
+            if found:
+                m_id = int(found.group(1))
+            conn.execute("UPDATE messages SET status='sent', gh_comment_id=? WHERE id=?",
+                         (m_id, m["id"]))
+            log(f"out #{m['id']} posted (comment {m_id})")
+        else:
+            log(f"out #{m['id']} post failed: {proc.stderr.strip()[:200]}")
+    conn.commit()
+
+
+def live_sessions(conn, ttl):
+    cutoff = time.time() - ttl
+    live = []
+    for s in conn.execute("SELECT * FROM sessions ORDER BY label").fetchall():
+        try:
+            hb = datetime.strptime(s["last_heartbeat"], "%Y-%m-%dT%H:%M:%SZ") \
+                .replace(tzinfo=timezone.utc).timestamp()
+        except (TypeError, ValueError):
+            hb = 0
+        if hb >= cutoff:
+            live.append(s)
+    return live
+
+
+def update_roster(conn, cfg, repo, issue, ttl):
+    live = live_sessions(conn, ttl)
+    lines = [
+        "<!-- agent-pager roster (auto-updated by pagerd) -->",
+        f"### Sessions on this machine: {len(live)} live  ·  updated {now_iso()}",
+        "",
+    ]
+    if live:
+        lines += ["| label | cwd | last seen |", "|---|---|---|"]
+        for s in live:
+            lines.append(f"| `{s['label']}` | {s['cwd'] or ''} | {s['last_heartbeat']} |")
+    else:
+        lines.append("_no live sessions right now_")
+    lines += [
+        "", "---",
+        "Comment to page: `@label: do X` targets one session, `@all!: do X` acts on all, "
+        "`@all: ...` or plain text is informational. See github.com/calebhaye/agent-pager.",
+    ]
+    body = "\n".join(lines)
+    proc = gh(cfg, ["issue", "edit", str(issue), "--repo", repo, "--body", body])
+    if proc.returncode != 0:
+        log(f"roster update failed: {proc.stderr.strip()[:160]}")
+
+
+def cmd_daemon(cfg, args):
+    repo, issue = cfg.get("PAGER_REPO"), cfg.get("PAGER_ISSUE")
+    if not repo or not issue:
+        die("PAGER_REPO and PAGER_ISSUE are required (config or env). Run `agent-pager init`.")
+    allow = {s.strip() for s in cfg.get("PAGER_ALLOWLIST", "").split(",") if s.strip()}
+    if not allow:
+        die("PAGER_ALLOWLIST is required for security: comma-separated GitHub logins "
+            "allowed to page this machine.")
+    owner = cfg.get("PAGER_OWNER", "")
+    poll = int(cfg.get("PAGER_POLL_SECONDS", "25"))
+    ttl = int(cfg.get("PAGER_SESSION_TTL", "900"))
+    conn = db()
+    log(f"pagerd start: repo={repo} issue=#{issue} allow={sorted(allow)} "
+        f"poll={poll}s owner={owner or '(none)'} bot={'yes' if cfg.get('PAGER_GH_TOKEN') else 'no'}")
+    tick = 0
+    while True:
+        try:
+            ingest(conn, cfg, repo, issue, allow)
+            drain(conn, cfg, repo, issue, owner)
+            if tick % 4 == 0:  # roster ~every 4 cycles
+                update_roster(conn, cfg, repo, issue, ttl)
+        except Exception as e:  # never let one bad cycle kill the daemon
+            log(f"cycle error: {type(e).__name__}: {e}")
+        if args.once:
+            return
+        tick += 1
+        time.sleep(poll)
+
+
+# ---------------------------------------------------------------- client side
+
+def cmd_init(cfg, args):
+    os.makedirs(HOME, exist_ok=True)
+    if os.path.exists(CONFIG_PATH) and not args.force:
+        print(f"config already exists at {CONFIG_PATH} (use --force to overwrite)")
+    else:
+        with open(CONFIG_PATH, "w") as f:
+            f.write(CONFIG_TEMPLATE)
+        os.chmod(CONFIG_PATH, 0o600)
+        print(f"wrote {CONFIG_PATH} — edit PAGER_REPO / PAGER_ISSUE / PAGER_OWNER / PAGER_ALLOWLIST")
+    db()
+    print(f"db ready at {DB_PATH}")
+
+
+def cmd_register(cfg, args):
+    conn = db()
+    conn.execute(
+        "INSERT INTO sessions(label,cwd,pid,started_at,last_heartbeat) VALUES(?,?,?,?,?) "
+        "ON CONFLICT(label) DO UPDATE SET cwd=excluded.cwd, pid=excluded.pid, "
+        "last_heartbeat=excluded.last_heartbeat",
+        (args.label, args.cwd or os.getcwd(), os.getpid(), now_iso(), now_iso()),
+    )
+    # New session starts caught up (no backlog of old pages).
+    conn.execute(
+        "INSERT OR IGNORE INTO cursors(label,last_msg_id) VALUES(?, "
+        "(SELECT COALESCE(MAX(id),0) FROM messages WHERE dir='in'))",
+        (args.label,),
+    )
+    conn.commit()
+    print(f"registered session '{args.label}'")
+
+
+def cmd_heartbeat(cfg, args):
+    conn = db()
+    conn.execute("UPDATE sessions SET last_heartbeat=? WHERE label=?", (now_iso(), args.label))
+    conn.commit()
+
+
+def cmd_inbox(cfg, args):
+    conn = db()
+    row = conn.execute("SELECT last_msg_id FROM cursors WHERE label=?", (args.label,)).fetchone()
+    last = row["last_msg_id"] if row else 0
+    rows = conn.execute("SELECT * FROM messages WHERE dir='in' AND id>? ORDER BY id", (last,)).fetchall()
+    out, max_id = [], last
+    for m in rows:
+        max_id = max(max_id, m["id"])
+        tag = relevance(m["target"], m["act"], args.label)
+        if tag is None:
+            continue  # addressed to another session
+        out.append({"id": m["id"], "tag": tag, "from": m["sender"], "ts": m["ts"], "body": m["body"]})
+    # Advance past everything inbound (including other sessions' messages) unless peeking.
+    if max_id > last and not args.peek:
+        conn.execute(
+            "INSERT INTO cursors(label,last_msg_id) VALUES(?,?) "
+            "ON CONFLICT(label) DO UPDATE SET last_msg_id=excluded.last_msg_id",
+            (args.label, max_id))
+        conn.commit()
+    if args.json:
+        print(json.dumps(out))
+        return
+    if not out:
+        print("(no new pages)")
+        return
+    for o in out:
+        print(f"#{o['id']} [{o['tag']}] from {o['from']} at {o['ts']}:\n  {o['body']}\n")
+
+
+def cmd_reply(cfg, args):
+    conn = db()
+    conn.execute(
+        "INSERT INTO messages(ts,dir,sender,body,via) VALUES(?,?,?,?,?)",
+        (now_iso(), "out", args.label, args.text, "sms" if args.sms else "comment"),
+    )
+    conn.commit()
+    print("reply queued (pagerd will post it)")
+
+
+def cmd_ack(cfg, args):
+    conn = db()
+    conn.execute("UPDATE messages SET status='acted' WHERE id=?", (args.id,))
+    conn.commit()
+    print(f"acked #{args.id}")
+
+
+def cmd_sessions(cfg, args):
+    conn = db()
+    ttl = int(cfg.get("PAGER_SESSION_TTL", "900"))
+    live = {s["label"] for s in live_sessions(conn, ttl)}
+    for s in conn.execute("SELECT * FROM sessions ORDER BY label").fetchall():
+        mark = "live" if s["label"] in live else "stale"
+        print(f"{s['label']:20} [{mark}]  {s['cwd'] or ''}  last={s['last_heartbeat']}")
+
+
+def cmd_send(cfg, args):
+    """Dev helper: inject a page locally, as if it arrived from GitHub."""
+    conn = db()
+    target, act = parse_target(args.text)
+    conn.execute(
+        "INSERT INTO messages(ts,dir,sender,target,act,body) VALUES(?,?,?,?,?,?)",
+        (now_iso(), "in", args.sender, target, act, args.text),
+    )
+    conn.commit()
+    print(f"injected local page target={target} act={act}")
+
+
+CONFIG_TEMPLATE = """# agent-pager config (~/.agent-pager/config). Keep this file private (chmod 600).
+PAGER_REPO=you/your-private-pager-repo
+PAGER_ISSUE=1
+PAGER_OWNER=your-github-login          # who gets @-mentioned on replies
+PAGER_ALLOWLIST=your-github-login      # comma-separated logins allowed to page this machine
+# PAGER_GH_TOKEN=                       # optional bot-account token; enables phone notifications on replies
+# PAGER_POLL_SECONDS=25
+# PAGER_SESSION_TTL=900
+"""
+
+
+def main():
+    p = argparse.ArgumentParser(prog="agent-pager", description=__doc__)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("init", help="write a config template and create the db")
+    sp.add_argument("--force", action="store_true")
+    sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("daemon", help="run the per-machine poller (pagerd)")
+    sp.add_argument("--once", action="store_true", help="run a single cycle and exit")
+    sp.set_defaults(func=cmd_daemon)
+
+    sp = sub.add_parser("register", help="register this session")
+    sp.add_argument("--label", required=True)
+    sp.add_argument("--cwd")
+    sp.set_defaults(func=cmd_register)
+
+    sp = sub.add_parser("heartbeat", help="mark this session alive")
+    sp.add_argument("--label", required=True)
+    sp.set_defaults(func=cmd_heartbeat)
+
+    sp = sub.add_parser("inbox", help="show new pages for this session")
+    sp.add_argument("--label", required=True)
+    sp.add_argument("--json", action="store_true")
+    sp.add_argument("--peek", action="store_true", help="do not advance the cursor")
+    sp.set_defaults(func=cmd_inbox)
+
+    sp = sub.add_parser("reply", help="queue a reply (pagerd posts it, @-mentioning the owner)")
+    sp.add_argument("--label", required=True)
+    sp.add_argument("text")
+    sp.add_argument("--sms", action="store_true", help="flag for the SMS sink (deferred)")
+    sp.set_defaults(func=cmd_reply)
+
+    sp = sub.add_parser("ack", help="mark a page acted-on")
+    sp.add_argument("id", type=int)
+    sp.set_defaults(func=cmd_ack)
+
+    sp = sub.add_parser("sessions", help="list registered sessions")
+    sp.set_defaults(func=cmd_sessions)
+
+    sp = sub.add_parser("send", help="dev: inject a local page (no GitHub)")
+    sp.add_argument("text")
+    sp.add_argument("--sender", default="test")
+    sp.set_defaults(func=cmd_send)
+
+    args = p.parse_args()
+    args.func(load_config(), args)
+
+
+if __name__ == "__main__":
+    main()

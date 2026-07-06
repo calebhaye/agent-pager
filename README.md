@@ -45,8 +45,9 @@ agent-pager init                                      # writes ~/.agent-pager/co
 $EDITOR ~/.agent-pager/config                         # set repo / issue / owner / allowlist
 ```
 
-Create one **private** issue per machine, titled e.g. `pager: studio`, and put
-its number in the config.
+Create a **separate private repo** for your inbox (not this public one), open one
+issue per machine in it titled e.g. `pager: studio`, and put the repo + issue
+number in the config. The daemon refuses to run against a public repo.
 
 ## Run the daemon (one per machine)
 
@@ -119,7 +120,12 @@ buzzed." Everything else works without it.
 
 A comment that drives local agents is remote control of your machines.
 
-- **Use a private repo.**
+- **The pager inbox repo must be PRIVATE, and this is enforced.** The daemon
+  verifies `PAGER_REPO` visibility on startup and refuses to run against a public
+  repo, because pages and the session roster would otherwise be world-readable.
+  In particular, do not use this public `agent-pager` repo as your inbox; create
+  a separate private repo. (Following a README note is not enough for a tool that
+  can drive machines, so the tool fails closed instead of trusting you to.)
 - The daemon acts **only** on comments from `PAGER_ALLOWLIST` (your login, plus
   the bot account if you use one). It refuses to start without an allowlist, and
   it logs and ignores everything from anyone else.

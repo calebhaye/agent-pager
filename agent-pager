@@ -131,6 +131,20 @@ def relevance(target, act, label):
     return None
 
 
+def assert_private_repo(cfg, repo):
+    """Fail closed unless `repo` is verified PRIVATE. A public pager inbox would
+    make every page and the session roster world-readable, so the daemon must
+    never run against one (this is enforcement, not advice)."""
+    proc, data = gh(cfg, ["repo", "view", repo, "--json", "visibility,nameWithOwner"], want_json=True)
+    if proc.returncode != 0 or not data:
+        die(f"cannot verify visibility of '{repo}': {proc.stderr.strip()[:160]}. "
+            "Refusing to run (fail closed).")
+    vis = data.get("visibility")
+    if vis != "PRIVATE":
+        die(f"'{repo}' is {vis}, not PRIVATE. The pager inbox MUST be a private repo: "
+            "pages and the roster would otherwise be world-readable. Refusing to run.")
+
+
 def gh(cfg, args, want_json=False):
     env = dict(os.environ)
     if cfg.get("PAGER_GH_TOKEN"):
@@ -253,6 +267,7 @@ def cmd_daemon(cfg, args):
     repo, issue = cfg.get("PAGER_REPO"), cfg.get("PAGER_ISSUE")
     if not repo or not issue:
         die("PAGER_REPO and PAGER_ISSUE are required (config or env). Run `agent-pager init`.")
+    assert_private_repo(cfg, repo)  # refuse public repos before doing anything else
     allow = {s.strip() for s in cfg.get("PAGER_ALLOWLIST", "").split(",") if s.strip()}
     if not allow:
         die("PAGER_ALLOWLIST is required for security: comma-separated GitHub logins "
